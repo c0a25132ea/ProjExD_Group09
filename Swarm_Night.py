@@ -132,6 +132,27 @@ def make_circle_surf(radius, color, border=None):
     return surf
 
 
+def load_image(path, size, fallback_color): #追加機能実装(杉本)
+    """fig/ 内の武器画像(png)を読み込む。
+        白背景が焼き込まれた画像でも透過されるように、左上ピクセルの色を背景色とみなして透過処理を追加
+        縦横比を保ったまま size の枠内に収めるよう変更"""
+    if os.path.exists(path):
+        img = pygame.image.load(path).convert_alpha()
+        corner = img.get_at((0, 0))
+        if corner.a == 255:  # 透過情報が無い場合の処理
+            keyed = pygame.image.load(path).convert()
+            keyed.set_colorkey((corner.r, corner.g, corner.b))  # 左上の色を背景色とみなして透過させる
+            img = pygame.Surface(keyed.get_size(), pygame.SRCALPHA)
+            img.blit(keyed, (0, 0))
+        w, h = img.get_size()
+        scale = min(size[0] / w, size[1] / h)
+        return pygame.transform.smoothscale(
+            img, (max(1, round(w * scale)), max(1, round(h * scale))))
+    surf = pygame.Surface(size, pygame.SRCALPHA)
+    pygame.draw.rect(surf, fallback_color, surf.get_rect(), border_radius=4)
+    return surf
+
+
 # =========================================================
 # 2. プレイヤー
 # =========================================================
@@ -150,6 +171,7 @@ class Player(pygame.sprite.Sprite):
         self.max_hp = PLAYER_MAX_HP
         self.hp = self.max_hp
         self.invincible_until = 0  # この時刻まで無敵
+        self.facing = (1.0, 0.0)   # 最後に移動した方向（槍・斧が参照）追加機能実装(杉本)
 
     def update(self, keys, now):
         #8方向移動
@@ -160,6 +182,8 @@ class Player(pygame.sprite.Sprite):
         if dx and dy:  # 斜め移動の速度を正規化
             dx *= 0.7071
             dy *= 0.7071
+        if dx or dy:
+            self.facing = (dx, dy)  # 移動中だけ向きを更新　追加機能実装(杉本)
         self.rect.x += dx * self.speed
         self.rect.y += dy * self.speed
         self.rect.clamp_ip(pygame.Rect(0, 0, WIDTH, HEIGHT))
@@ -283,7 +307,7 @@ class Weapon:
         self.interval = FIRE_INTERVAL
         self.last_fired = 0
 
-    def update(self, now, player, enemies, bullets):
+    def update(self, now, player, enemies, bullets, attacks): #attacksも追加　追加実装(杉本)
         if now - self.last_fired < self.interval:
             return
         target = self._nearest_enemy(player, enemies)
@@ -303,6 +327,154 @@ class Weapon:
                 best, nearest = d, e
         return nearest
 
+
+# ---------------------------------------------------------
+# 追加武器: 剣（回転斬撃）・槍（突き）・斧（投擲）
+# いずれも「attacks グループに攻撃スプライトを生成する」武器。
+# 攻撃スプライトは hit_ids で「同じ敵に1回だけ当たる」貫通型。
+# ---------------------------------------------------------
+
+class SwordSlash(pygame.sprite.Sprite):
+    """剣: プレイヤーの周囲を一回転する斬撃。"""
+    DURATION = 600   # 一回転にかかる時間 (ms)
+    RADIUS = 70      # プレイヤーからの距離
+    DAMAGE = 2
+ 
+    def __init__(self, player, now, base_image):
+        super().__init__()
+        self.player = player          # 回転中心（常にプレイヤーに追従）
+        self.t0 = now
+        self.base_image = base_image
+        self.damage = self.DAMAGE
+        self.hit_ids = set()          # 命中済みの敵（多段ヒット防止）
+        fx, fy = player.facing
+        self.angle0 = math.degrees(math.atan2(fy, fx))  # 向いている方向から回り始める
+        self._place(now)
+ 
+    def _place(self, now):
+        t = min(1.0, (now - self.t0) / self.DURATION)
+        ang = self.angle0 + 360 * t
+        rad = math.radians(ang)
+        cx = self.player.rect.centerx + self.RADIUS * math.cos(rad)
+        cy = self.player.rect.centery + self.RADIUS * math.sin(rad) # 刃先が進行方向を向くように回転（画像は右向きが基準）
+        self.image = pygame.transform.rotate(self.base_image, -ang)
+        self.rect = self.image.get_rect(center=(cx, cy))
+ 
+    def update(self, now):
+        if now - self.t0 >= self.DURATION:
+            self.kill()
+            return
+        self._place(now)
+ 
+ 
+class SpearThrust(pygame.sprite.Sprite):
+    """槍: 向いている方向へ突き出して戻る、直線の貫通攻撃。"""
+    DURATION = 300   # 突いて戻るまでの時間 (ms)
+    REACH = 110      # 最大リーチ
+    DAMAGE = 2
+ 
+    def __init__(self, player, now, base_image):
+        super().__init__()
+        self.player = player
+        self.t0 = now
+        self.damage = self.DAMAGE
+        self.hit_ids = set()
+        fx, fy = player.facing
+        d = math.hypot(fx, fy) or 1
+        self.dir = (fx / d, fy / d)   # 発動時の向きで固定
+        ang = math.degrees(math.atan2(self.dir[1], self.dir[0]))
+        self.image = pygame.transform.rotate(base_image, -ang)
+        self._place(now)
+ 
+    def _place(self, now):
+        t = min(1.0, (now - self.t0) / self.DURATION)
+        dist = 30 + (self.REACH - 30) * math.sin(math.pi * t)  # 伸びて戻る
+        cx = self.player.rect.centerx + self.dir[0] * dist
+        cy = self.player.rect.centery + self.dir[1] * dist
+        self.rect = self.image.get_rect(center=(cx, cy))
+ 
+    def update(self, now):
+        if now - self.t0 >= self.DURATION:
+            self.kill()
+            return
+        self._place(now)
+ 
+ 
+class AxeProjectile(pygame.sprite.Sprite):
+    """斧: 放物線を描いて飛ぶ投擲武器（重力あり・回転しながら飛ぶ・貫通）。"""
+    GRAVITY = 0.35
+    DAMAGE = 3
+ 
+    def __init__(self, pos, direction, base_image):
+        super().__init__()
+        self.base_image = base_image
+        self.damage = self.DAMAGE
+        self.hit_ids = set()
+        self.x, self.y = float(pos[0]), float(pos[1])
+        self.vx = direction * random.uniform(2.0, 4.0)   # 左右方向
+        self.vy = -random.uniform(9.0, 12.0)             # 上向きに投げる
+        self.spin = random.choice([-1, 1]) * 12          # 回転速度 (度/フレーム)
+        self.angle = 0.0
+        self.image = base_image
+        self.rect = self.image.get_rect(center=pos)
+ 
+    def update(self, now):
+        self.vy += self.GRAVITY
+        self.x += self.vx
+        self.y += self.vy
+        self.angle = (self.angle + self.spin) % 360
+        self.image = pygame.transform.rotate(self.base_image, self.angle)
+        self.rect = self.image.get_rect(center=(round(self.x), round(self.y)))
+        if self.y > HEIGHT + 60 or self.x < -60 or self.x > WIDTH + 60:
+            self.kill()
+ 
+ 
+class SwordWeapon:
+    """一定間隔で回転斬撃を出す。"""
+    def __init__(self, image):
+        self.interval = 2000
+        self.last_fired = 0
+        self.image = image
+ 
+    def update(self, now, player, enemies, bullets, attacks):
+        if now - self.last_fired < self.interval:
+            return
+        attacks.add(SwordSlash(player, now, self.image))
+        self.last_fired = now
+ 
+ 
+class SpearWeapon:
+    """一定間隔で向いている方向へ突きを出す。"""
+    def __init__(self, image):
+        self.interval = 1500
+        self.last_fired = 0
+        self.image = image
+ 
+    def update(self, now, player, enemies, bullets, attacks):
+        if now - self.last_fired < self.interval:
+            return
+        attacks.add(SpearThrust(player, now, self.image))
+        self.last_fired = now
+ 
+ 
+class AxeWeapon:
+    """一定間隔で斧を放物線投擲する。最も近い敵のいる側へ投げる。"""
+    def __init__(self, image):
+        self.interval = 2500
+        self.last_fired = 0
+        self.image = image
+ 
+    def update(self, now, player, enemies, bullets, attacks):
+        if now - self.last_fired < self.interval:
+            return
+        target = Weapon._nearest_enemy(player, enemies)
+        if target is not None:
+            direction = 1 if target.rect.centerx >= player.rect.centerx else -1
+        else:
+            direction = 1 if player.facing[0] >= 0 else -1
+        attacks.add(AxeProjectile(player.rect.center, direction, self.image))
+        self.last_fired = now
+ 
 
 # =========================================================
 # 6. UI
@@ -363,14 +535,19 @@ def draw_gameover(screen, font_big, font, elapsed_ms, kills):
 # =========================================================
 
 def reset_game():
-    """ゲーム開始/リスタート時の初期化。状態一式を dict で返す。"""
+    """ゲーム開始/リスタート時の初期化。状態一式を dict で返す。"""# 修正: 剣・槍・斧の武器画像(fig/内のpng)を読み込む処理を追加
+    img_sword = load_image("fig/sord01.png", (70, 70), (200, 200, 220))
+    img_spear = load_image("fig/yari01.png", (100, 100), (180, 140, 90))
+    img_axe = load_image("fig/ono.png", (55, 55), (150, 150, 160))
     return {
         "player": Player((WIDTH // 2, HEIGHT // 2)),
         "enemies": pygame.sprite.Group(),
-        "bullets": pygame.sprite.Group(),
-        # [拡張] items: pygame.sprite.Group() をここに足せば
-        #        アイテムドロップ機能のグループ管理ができる
-        "weapons": [Weapon()],   # [拡張] 武器追加時はこのリストに append
+        "bullets": pygame.sprite.Group(),# 修正: 剣・槍・斧などの近接攻撃スプライトを管理するグループを追加 追加実装(杉本)
+        "attacks": pygame.sprite.Group(), # 修正: 3武器(剣・槍・斧)をweaponsリストに登録　追加実装(杉本)
+        "weapons": [Weapon(),
+                    SwordWeapon(img_sword),
+                    SpearWeapon(img_spear),
+                    AxeWeapon(img_axe)],
         "start_ms": pygame.time.get_ticks(),
         "last_spawn": 0,
         "kills": 0,
@@ -424,8 +601,9 @@ def main():
 
             enemies.update(player)
             for weapon in game["weapons"]:
-                weapon.update(now, player, enemies, bullets)
+                weapon.update(now, player, enemies, bullets, game["attacks"])
             bullets.update()
+            game["attacks"].update(now)   # 追加実装(杉本)
 
             # --- 5. 当たり判定 ---
             # 弾 × 敵
@@ -434,8 +612,13 @@ def main():
                 for enemy in hit_enemies:
                     if enemy.take_damage(bullet.damage):
                         game["kills"] += 1
-                        # [拡張] 撃破時: アイテムドロップ・スコア加算・撃破SE
-
+            for attack in game["attacks"]:# 修正: 近接攻撃(剣・槍・斧) × 敵 の当たり判定を追加hit_ids で「同じ敵には1回だけ当たる」貫通型にしている　追加実装(杉本)
+                for enemy in pygame.sprite.spritecollide(attack, enemies, False):
+                    if id(enemy) in attack.hit_ids:
+                        continue
+                    attack.hit_ids.add(id(enemy))
+                    if enemy.take_damage(attack.damage):
+                        game["kills"] += 1
             # 敵 × プレイヤー
             touched = pygame.sprite.spritecollide(player, enemies, False)
             if touched:
@@ -448,12 +631,14 @@ def main():
         screen.fill(COL_BG)
         if state == "PLAY":
             game["bullets"].draw(screen)
+            game["attacks"].draw(screen)
             game["enemies"].draw(screen)
             game["player"].draw(screen, now)
             draw_hud(screen, font, game["player"],
                      now - game["start_ms"], game["kills"])
         else:  # GAMEOVER
             game["bullets"].draw(screen)
+            game["attacks"].draw(screen)
             game["enemies"].draw(screen)
             draw_hud(screen, font, game["player"], final_time, game["kills"])
             draw_gameover(screen, font_big, font, final_time, game["kills"])
